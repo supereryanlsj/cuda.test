@@ -78,6 +78,94 @@ void __global__ gemv(
   }
 }
 
+void __global__ gemvQ40(
+  uint8_t* A, float* B, float* C,
+  int outputRow, int outputCol, int hiddenDim) {
+  // Warp index
+  int h = blockIdx.x; // 0~B.x
+  //int by = blockIdx.y; // 0~A.y/32
+
+  // Thread index
+  int hh = threadIdx.x / 32; // [0, 4)
+  int sgId = threadIdx.x & 0x1f; // [0, 32)
+  //int ty = threadIdx.y; // 0~1
+
+  int offsetA = h * 32 * hiddenDim / 8 + hh * 32;
+  int offsetB;
+  int offsetC = h * 32;
+  uchar4 aaa[4];
+  float aa[32];
+  float bb[32];
+  float cc;
+  float ccSum[4];
+  __shared__ float ccShm[32 * 4];
+
+  offsetB = hh * 32;
+  uchar4* aTemp = (uchar4*)A;
+#pragma unroll
+  for (int nn = 0; nn < 32; nn++) {
+    bb[nn] = B[offsetB + sgId];
+    offsetB += 128;
+  }
+
+  for (int n = 0; n < 32; n++) {
+    cc = 0;
+#pragma unroll
+    for (int nn = 0; nn < 4; nn++) {
+      aaa[nn] = aTemp[offsetA + sgId];
+      offsetA += 128;
+    }
+
+#pragma unroll
+    for (int nn = 0; nn < 16; nn++) {
+      int nnWave = nn >> 2; // [0, 4)
+      int nnIdx = nn & 0x3; // [0, 4)
+      int shflLane = (sgId >> 2) + nnIdx * 8;
+      int uchar4ArrayIdx = nnWave;
+      int uchar4ArrayOffset = (sgId & 3);
+      aa[2 * nn] = __shfl_sync(0xffffffff, aaa[uchar4ArrayIdx].x, shflLane, 32) & 0xf;
+      aa[2 * nn + 1] = __shfl_sync(0xffffffff, aaa[uchar4ArrayIdx].y, shflLane, 32) >> 4;
+      if (h == 0 && hh == 0 && n == 0) {
+        printf("sgId: %d, nn = %d, shflLane = %d, uchar4ArrayIdx = %d, uchar4ArrayOffset = %d, aa[2 * nn] = %f, aa[2 * nn + 1] = %f\n", sgId, nn, shflLane, uchar4ArrayIdx, uchar4ArrayOffset, aa[2 * nn], aa[2 * nn + 1]);
+      }
+    }
+
+#pragma unroll
+    for (int nn = 0; nn < 32; nn++) {
+      aa[nn] = aa[nn] - 8.0f;
+    }
+
+#pragma unroll
+    for (int nn = 0; nn < 32; nn++) {
+      cc += aa[nn] * bb[nn];
+    }
+#pragma unroll
+    for (int l = 32; l > 1; l >>= 1) {
+      cc += __shfl_xor_sync(0xffffffff, cc, l - 1, 32);
+    }
+
+    if (sgId == 0) {
+      ccShm[n + 32 * hh] = cc;
+    }
+  }
+
+  __syncthreads();
+
+  if (hh == 0) {
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+      ccSum[k] = ccShm[32 * k + sgId];
+    }
+
+#pragma unroll
+    for (int k = 1; k < 4; k++) {
+      ccSum[0] += ccSum[k];
+    }
+
+    C[offsetC + sgId] = ccSum[0];
+  }
+}
+
 int testGemvQ40(int m, int n, int k, int numbIter) {
   // Allocate host memory for matrices A and B
   cudaStream_t stream;
@@ -88,8 +176,8 @@ int testGemvQ40(int m, int n, int k, int numbIter) {
   size_t sizeB = n * k * sizeof(float);
   size_t sizeC = m * n * sizeof(float);
   uint8_t* hostA;
-  uint8_t* hostB;
-  uint8_t* hostC;
+  float* hostB;
+  float* hostC;
   uint16_t* hostQuant;
 
   uint8_t* deviceA[10];
@@ -106,7 +194,7 @@ int testGemvQ40(int m, int n, int k, int numbIter) {
   ret = cudaMallocHost(&hostA, sizeA);
   ret = cudaMallocHost(&hostB, sizeB);
   ret = cudaMallocHost(&hostC, sizeC);
-  hostQuant = (uint16_t*)(hostA + m * n / 2);
+  hostQuant = (uint16_t*)(hostA + m * k / 2);
   if (k > m) {
     for (int row = 0; row < m; row++) {
       int temp = (k - m + row) / 2;
@@ -159,6 +247,7 @@ int testGemvQ40(int m, int n, int k, int numbIter) {
   for (int nn = 0; nn < 10; nn++) {
     cudaMalloc(reinterpret_cast<void**>(&deviceA[nn]), sizeA);
     cudaMalloc(reinterpret_cast<void**>(&deviceB[nn]), sizeB);
+    cudaMalloc(reinterpret_cast<void**>(&deviceC[nn]), sizeC);
     cudaMemcpyAsync(deviceA[nn], hostA, sizeA, cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(deviceB[nn], hostB, sizeB, cudaMemcpyHostToDevice, stream);
   }
@@ -171,12 +260,12 @@ int testGemvQ40(int m, int n, int k, int numbIter) {
     int bufffIdx = j % 10;
     // Record the start event
     cudaEventRecord(start, stream);
-    gemv<<<grid, threads, 0, stream >>>((float*)deviceA[bufffIdx], (float*)deviceB[bufffIdx], (float*)deviceC[bufffIdx], m, 1, k);
+    gemvQ40 <<<grid, threads, 0, stream >>>((uint8_t*)deviceA[bufffIdx], (float*)deviceB[bufffIdx], (float*)deviceC[bufffIdx], m, 1, k);
 
     cudaEventRecord(stop, stream);
     // Wait for the stop event to complete
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&singleIterTime, start, stop);
+    ret = cudaEventSynchronize(stop);
+    ret = cudaEventElapsedTime(&singleIterTime, start, stop);
     msecTotal += singleIterTime;
   }
 
@@ -193,7 +282,7 @@ int testGemvQ40(int m, int n, int k, int numbIter) {
       gigaFlops, msecPerMatrixMul, flopsPerMatrixMul, threads.x * threads.y);
 
   // Copy result from device to host
-  cudaMemcpyAsync(hostC, deviceC, sizeC, cudaMemcpyDeviceToHost, stream);
+  cudaMemcpyAsync(hostC, deviceC[0], sizeC, cudaMemcpyDeviceToHost, stream);
   cudaStreamSynchronize(stream);
 
   printf("Checking computed result for correctness: ");
