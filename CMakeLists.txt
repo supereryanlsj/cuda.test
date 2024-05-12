@@ -1,0 +1,23 @@
+cmake_minimum_required(VERSION 3.24)
+project(cuda.test)
+set(CMAKE_CXX_STANDARD 17)
+include(CheckLanguage)
+if(NOT CUDAToolkit_Found)
+  include(FindCUDAToolkit)
+endif()
+include_directories(${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+check_language(CUDA)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+macro(add_subprojects)
+  file(GLOB files RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/*)
+  foreach(path ${files})
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${path}/CMakeLists.txt)
+      add_subdirectory(${path})
+    endif()
+  endforeach()
+endmacro()
+
+add_subprojects()
+
